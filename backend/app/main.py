@@ -1,3 +1,9 @@
+"""Application entry point.
+
+Creates the FastAPI application and wires up logging, CORS, and the routes
+available at this stage of the build. Routes stay thin; this module only
+assembles them, it does not contain business logic.
+"""
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
@@ -7,7 +13,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api import health
 from app.core.config import get_settings
 from app.core.logging import configure_logging, get_logger
-from app.persistence.database import dispose_engine
+from app.persistence.database import dispose_engine, get_engine
+from app.persistence.models import init_models
 
 settings = get_settings()
 configure_logging(settings.log_level)
@@ -16,10 +23,8 @@ logger = get_logger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    logger.info(
-        "application_startup",
-        extra={"environment": settings.environment},
-    )
+    logger.info("application_startup", extra={"environment": settings.environment})
+    await init_models(get_engine())
     yield
     logger.info("application_shutdown")
     await dispose_engine()
