@@ -1,25 +1,56 @@
 # Project Sentinel
 
-AI-powered software engineering documentation analysis system.
+An AI-powered Project Documentation Analyst that continuously analyzes software engineering documentation — PRDs, SRS, architecture documents, API specifications, sprint documents, meeting notes, test plans, release notes, risk registers, bug reports, and change requests — detects inconsistencies across them, validates them against configurable engineering rules, and maintains evidence-backed reports through a human-approved incremental update workflow.
 
-This repository contains the reviewed implementation foundation. The application is being built incrementally so each engineering layer can be tested before the next is introduced.
+## Status
 
-## Current foundation
+This repository currently contains the **repository foundation** (Build Order 001): infrastructure, backend bootstrap, and frontend bootstrap. The application layer — document ingestion, the LangGraph workflow, agents, the review queue, and reporting — is implemented in later Build Orders and is not yet present. The backend currently exposes a single endpoint (`/health`); the frontend currently renders a single placeholder page.
 
-- FastAPI backend
-- React + TypeScript frontend
-- PostgreSQL + pgvector
-- Docker Compose
-- Environment-driven configuration
-- Structured JSON logging
-- Backend liveness endpoint
-- Basic backend test
+## Stack
 
-## Run
+- **Frontend:** React, TypeScript, Tailwind CSS, shadcn/ui
+- **Backend:** FastAPI
+- **Workflow:** LangGraph (not yet implemented — foundation only)
+- **Database:** PostgreSQL + pgvector
+- **Storage:** local document storage
+- **Deployment:** Docker Compose
 
-1. Copy `.env.example` to `.env`.
-2. Run `docker compose up --build`.
-3. Open `http://localhost:5173`.
-4. Check backend health at `http://localhost:8000/health`.
+## Running locally
 
-Application capabilities will be added incrementally in later build orders.
+Requires Docker and Docker Compose.
+
+1. Copy the environment template and adjust values as needed:
+
+   ```bash
+   cp .env.example .env
+   ```
+
+2. Build and start the stack:
+
+   ```bash
+   docker compose up -d --build
+   ```
+
+3. Confirm the backend is healthy:
+
+   ```bash
+   curl http://localhost:8000/health
+   ```
+
+4. Open the frontend:
+
+   ```
+   http://localhost:5173
+   ```
+
+## Running backend tests
+
+Tests run through a dedicated Compose profile, kept separate from the production backend image so test tooling never ships in it:
+
+```bash
+docker compose --profile test run --rm backend-test
+```
+
+## License
+
+MIT — see [LICENSE](./LICENSE).
