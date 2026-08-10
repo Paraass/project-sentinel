@@ -96,11 +96,17 @@ class WorkflowRun(Base):
 
 
 class Document(Base):
-    """A document registered against a run at intake.
+    """A document registered against a run at intake, with its actual
+    content durably stored (see app/storage/document_storage.py) and
+    enough metadata here to retrieve it reliably.
 
-    Deliberately minimal: a filename/label is all this batch needs to prove
-    a run can own documents. Classification, extraction, and content parsing
-    belong to a later batch, not to this table.
+    storage_key and content_hash are kept as separate columns even though
+    the current filesystem storage backend derives one from the other
+    (storage_key IS the content hash) — the two are conceptually distinct
+    (one is "where," the other is "what"), and a future storage backend
+    (e.g. object storage with its own key scheme) could make that
+    distinction real. Classification, extraction, and content parsing
+    still belong to a later batch, not to this table.
     """
 
     __tablename__ = "documents"
@@ -112,6 +118,10 @@ class Document(Base):
         UUID(as_uuid=True), ForeignKey("workflow_runs.id", ondelete="CASCADE"), nullable=False
     )
     filename: Mapped[str] = mapped_column(String(512), nullable=False)
+    storage_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(nullable=False)
+    content_type: Mapped[str] = mapped_column(String(255), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )

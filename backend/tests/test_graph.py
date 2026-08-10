@@ -12,6 +12,11 @@ from sqlalchemy import select
 from app.orchestration.graph import build_graph, run_workflow
 from app.orchestration.workflow_service import create_run, start_stage
 from app.persistence.models import CheckpointStatus, StageCheckpoint, WorkflowState
+from app.storage.document_storage import DocumentInput
+
+
+def _doc(filename: str, content: bytes = b"test content") -> DocumentInput:
+    return DocumentInput(filename=filename, content=content)
 
 
 # --- Graph can be constructed/compiled ------------------------------------
@@ -31,7 +36,7 @@ async def test_graph_builds_and_compiles(db_session):
 
 @pytest.mark.asyncio
 async def test_cold_start_path_creates_run_and_completes_it(db_session):
-    result = await run_workflow(db_session, filenames=["a.pdf", "b.pdf"])
+    result = await run_workflow(db_session, documents=[_doc("a.pdf"), _doc("b.pdf")])
 
     assert "run_id" in result
     assert "error" not in result or result["error"] is None
@@ -64,7 +69,7 @@ async def test_resume_path_skips_intake_and_finishes_interrupted_processing(db_s
     # Simulate a run that crashed after PROCESSING started but before it
     # completed — exactly the Batch 6 crash scenario, now driven through
     # the graph instead of calling workflow_service directly.
-    run = await create_run(db_session, filenames=["c.pdf"])
+    run = await create_run(db_session, documents=[_doc("c.pdf")])
     await db_session.commit()
     await start_stage(db_session, run.id, WorkflowState.PROCESSING)
     await db_session.commit()
@@ -115,7 +120,7 @@ async def test_resume_path_skips_intake_and_finishes_interrupted_processing(db_s
 
 @pytest.mark.asyncio
 async def test_completed_run_routes_straight_to_end(db_session):
-    result = await run_workflow(db_session, filenames=["d.pdf"])
+    result = await run_workflow(db_session, documents=[_doc("d.pdf")])
     run_id = uuid.UUID(result["run_id"])
 
     processing_checkpoints_before = (

@@ -27,6 +27,7 @@ from app.persistence.models import (
     WorkflowRun,
     WorkflowState,
 )
+from app.storage.document_storage import DocumentInput, save_document
 
 # The only stage sequence this batch knows about. Later batches extend this
 # as real movement-level states (CLASSIFYING, EXTRACTING, ...) replace
@@ -87,24 +88,37 @@ async def get_run(session: AsyncSession, run_id: uuid.UUID) -> WorkflowRun:
 
 async def create_run(
     session: AsyncSession,
-    filenames: list[str],
+    documents: list[DocumentInput],
     name: str | None = None,
 ) -> WorkflowRun:
-    """Create a new run, register its documents, and durably complete the
-    INTAKE_PENDING stage.
+    """Create a new run, durably store each document's actual content, and
+    register the resulting rows, then durably complete the INTAKE_PENDING
+    stage.
 
-    Intake's "work" (registering documents) happens atomically here, so it
-    is recorded as an already-completed checkpoint rather than an
-    IN_PROGRESS one — there is no partial-intake state this batch needs to
-    model, unlike PROCESSING, which is where a real interruption risk
-    exists.
+    Content is written to disk (via app.storage.document_storage) before
+    the Document row referencing it is added, so a row is never persisted
+    pointing at content that doesn't actually exist on disk. Intake's
+    "work" happens atomically here, so it is recorded as an
+    already-completed checkpoint rather than an IN_PROGRESS one — there is
+    no partial-intake state this batch needs to model, unlike PROCESSING,
+    which is where a real interruption risk exists.
     """
     run = WorkflowRun(name=name, current_state=WorkflowState.INTAKE_PENDING)
     session.add(run)
     await session.flush()  # populate run.id before children reference it
 
-    for filename in filenames:
-        session.add(Document(run_id=run.id, filename=filename))
+    for document_input in documents:
+        stored = save_document(document_input)
+        session.add(
+            Document(
+                run_id=run.id,
+                filename=document_input.filename,
+                storage_key=stored.storage_key,
+                content_hash=stored.content_hash,
+                size_bytes=stored.size,
+                content_type=stored.content_type,
+            )
+        )
 
     session.add(
         StageCheckpoint(

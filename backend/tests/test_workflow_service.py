@@ -36,7 +36,14 @@ from app.persistence.models import (
     StageCheckpoint,
     WorkflowState,
 )
+from app.storage.document_storage import DocumentInput, read_document
 from tests.conftest import TEST_DATABASE_URL
+
+
+def _doc(filename: str, content: bytes = b"test content") -> DocumentInput:
+    """Small local factory to keep test call sites short — this batch
+    requires create_run to receive real content, not just a filename."""
+    return DocumentInput(filename=filename, content=content)
 
 
 # --- 1. A workflow can be created and persisted --------------------------
@@ -44,7 +51,7 @@ from tests.conftest import TEST_DATABASE_URL
 
 @pytest.mark.asyncio
 async def test_create_run_persists_run_and_documents(db_session):
-    run = await create_run(db_session, filenames=["a.pdf", "b.pdf"], name="test-pile")
+    run = await create_run(db_session, documents=[_doc("a.pdf"), _doc("b.pdf")], name="test-pile")
     await db_session.commit()
 
     assert run.id is not None
@@ -53,6 +60,19 @@ async def test_create_run_persists_run_and_documents(db_session):
     result = await db_session.execute(select(Document).where(Document.run_id == run.id))
     documents = result.scalars().all()
     assert {d.filename for d in documents} == {"a.pdf", "b.pdf"}
+
+    # Metadata is persisted, correctly, per document.
+    import hashlib
+
+    expected_hash = hashlib.sha256(b"test content").hexdigest()
+    for doc in documents:
+        assert doc.content_hash == expected_hash
+        assert doc.storage_key == expected_hash  # content-addressed: key IS the hash
+        assert doc.size_bytes == len(b"test content")
+        assert doc.content_type == "application/pdf"  # guessed from the .pdf filename
+
+    # And the stored content is genuinely retrievable, not just referenced.
+    assert read_document(documents[0].storage_key) == b"test content"
 
     result = await db_session.execute(
         select(StageCheckpoint).where(StageCheckpoint.run_id == run.id)
@@ -68,7 +88,7 @@ async def test_create_run_persists_run_and_documents(db_session):
 
 @pytest.mark.asyncio
 async def test_start_stage_persists_transition(db_session):
-    run = await create_run(db_session, filenames=["doc.pdf"])
+    run = await create_run(db_session, documents=[_doc("doc.pdf")])
     await db_session.commit()
 
     checkpoint = await start_stage(db_session, run.id, WorkflowState.PROCESSING)
@@ -86,7 +106,7 @@ async def test_start_stage_persists_transition(db_session):
 
 @pytest.mark.asyncio
 async def test_invalid_transition_is_rejected(db_session):
-    run = await create_run(db_session, filenames=["doc.pdf"])
+    run = await create_run(db_session, documents=[_doc("doc.pdf")])
     await db_session.commit()
 
     # INTAKE_PENDING -> COMPLETED is not an allowed transition; PROCESSING
@@ -105,7 +125,7 @@ async def test_invalid_transition_is_rejected(db_session):
 
 @pytest.mark.asyncio
 async def test_completed_output_survives_new_session(db_session):
-    run = await create_run(db_session, filenames=["doc.pdf"])
+    run = await create_run(db_session, documents=[_doc("doc.pdf")])
     await db_session.commit()
 
     await start_stage(db_session, run.id, WorkflowState.PROCESSING)
@@ -142,7 +162,7 @@ async def test_completed_output_survives_new_session(db_session):
 
 @pytest.mark.asyncio
 async def test_resume_after_interrupted_processing_identifies_processing(db_session):
-    run = await create_run(db_session, filenames=["doc.pdf"])
+    run = await create_run(db_session, documents=[_doc("doc.pdf")])
     await db_session.commit()
 
     # PROCESSING is started and committed, but never completed — this is
@@ -166,7 +186,7 @@ async def test_resume_after_interrupted_processing_identifies_processing(db_sess
 
 @pytest.mark.asyncio
 async def test_resume_after_completed_processing_does_not_rerun(db_session):
-    run = await create_run(db_session, filenames=["doc.pdf"])
+    run = await create_run(db_session, documents=[_doc("doc.pdf")])
     await db_session.commit()
 
     await start_stage(db_session, run.id, WorkflowState.PROCESSING)
@@ -194,7 +214,7 @@ async def test_resume_after_completed_processing_does_not_rerun(db_session):
 
 @pytest.mark.asyncio
 async def test_complete_stage_without_in_progress_checkpoint_raises(db_session):
-    run = await create_run(db_session, filenames=["doc.pdf"])
+    run = await create_run(db_session, documents=[_doc("doc.pdf")])
     await db_session.commit()
 
     # PROCESSING was never started, so there is nothing to complete.

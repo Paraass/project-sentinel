@@ -41,6 +41,7 @@ from app.orchestration.workflow_service import (
     start_stage,
 )
 from app.persistence.models import Document, WorkflowState
+from app.storage.document_storage import DocumentInput
 
 
 class SentinelGraphState(TypedDict, total=False):
@@ -48,12 +49,12 @@ class SentinelGraphState(TypedDict, total=False):
 
     Only `run_id` matters across a restart — a resumed invocation is called
     with the same run_id it was given before, and everything else here is
-    scratch space for that one invocation, not itself durable. `filenames`
+    scratch space for that one invocation, not itself durable. `documents`
     is only meaningful when starting a brand new run (no run_id yet).
     """
 
     run_id: str
-    filenames: list[str]
+    documents: list[DocumentInput]
     error: str | None
 
 
@@ -64,7 +65,7 @@ async def _intake_node(state: SentinelGraphState, *, session: AsyncSession) -> S
     resumed invocation always already has a run_id, so this node is skipped
     by routing, not by a check inside the node itself.
     """
-    run = await create_run(session, filenames=state.get("filenames", []))
+    run = await create_run(session, documents=state.get("documents", []))
     await session.commit()
     return {**state, "run_id": str(run.id)}
 
@@ -173,19 +174,19 @@ async def run_workflow(
     session: AsyncSession,
     *,
     run_id: uuid.UUID | None = None,
-    filenames: list[str] | None = None,
+    documents: list[DocumentInput] | None = None,
 ) -> SentinelGraphState:
     """Convenience entry point: build the graph and invoke it once.
 
-    Pass `run_id` to resume an existing run (filenames are ignored in that
-    case, since intake is skipped). Pass `filenames` with no `run_id` to
+    Pass `run_id` to resume an existing run (documents are ignored in that
+    case, since intake is skipped). Pass `documents` with no `run_id` to
     start a brand new one.
     """
     graph = build_graph(session)
     initial_state: SentinelGraphState = {}
     if run_id is not None:
         initial_state["run_id"] = str(run_id)
-    if filenames is not None:
-        initial_state["filenames"] = filenames
+    if documents is not None:
+        initial_state["documents"] = documents
 
     return await graph.ainvoke(initial_state)
