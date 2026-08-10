@@ -203,9 +203,19 @@ async def fail_stage(
     return checkpoint
 
 
-async def _in_progress_checkpoint(
+async def find_in_progress_checkpoint(
     session: AsyncSession, run_id: uuid.UUID, stage: WorkflowState
-) -> StageCheckpoint:
+) -> StageCheckpoint | None:
+    """Return the IN_PROGRESS checkpoint for (run_id, stage), or None.
+
+    A pure read — unlike `_in_progress_checkpoint` below, it never raises.
+    This is what lets a caller (a LangGraph node, in Batch 7) tell the
+    difference between "this stage was already started and needs
+    resuming" and "this stage has never been started," without needing to
+    catch an exception to find out. complete_stage/fail_stage still use the
+    raising variant below, since for them a missing checkpoint genuinely is
+    an error condition, not a branch to route on.
+    """
     result = await session.execute(
         select(StageCheckpoint).where(
             StageCheckpoint.run_id == run_id,
@@ -213,7 +223,13 @@ async def _in_progress_checkpoint(
             StageCheckpoint.status == CheckpointStatus.IN_PROGRESS,
         )
     )
-    checkpoint = result.scalar_one_or_none()
+    return result.scalar_one_or_none()
+
+
+async def _in_progress_checkpoint(
+    session: AsyncSession, run_id: uuid.UUID, stage: WorkflowState
+) -> StageCheckpoint:
+    checkpoint = await find_in_progress_checkpoint(session, run_id, stage)
     if checkpoint is None:
         raise StageNotInProgressError(run_id, stage)
     return checkpoint
