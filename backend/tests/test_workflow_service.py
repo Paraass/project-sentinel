@@ -91,14 +91,14 @@ async def test_start_stage_persists_transition(db_session):
     run = await create_run(db_session, documents=[_doc("doc.pdf")])
     await db_session.commit()
 
-    checkpoint = await start_stage(db_session, run.id, WorkflowState.PROCESSING)
+    checkpoint = await start_stage(db_session, run.id, WorkflowState.CLASSIFYING)
     await db_session.commit()
 
     assert checkpoint.status == CheckpointStatus.IN_PROGRESS
-    assert checkpoint.stage == WorkflowState.PROCESSING
+    assert checkpoint.stage == WorkflowState.CLASSIFYING
 
     reloaded = await get_run(db_session, run.id)
-    assert reloaded.current_state == WorkflowState.PROCESSING
+    assert reloaded.current_state == WorkflowState.CLASSIFYING
 
 
 # --- 6. Invalid state transitions are rejected ----------------------------
@@ -109,8 +109,8 @@ async def test_invalid_transition_is_rejected(db_session):
     run = await create_run(db_session, documents=[_doc("doc.pdf")])
     await db_session.commit()
 
-    # INTAKE_PENDING -> COMPLETED is not an allowed transition; PROCESSING
-    # must happen first.
+    # INTAKE_PENDING -> COMPLETED is not an allowed transition; the four
+    # analytical stages must happen first.
     with pytest.raises(InvalidStateTransitionError):
         await start_stage(db_session, run.id, WorkflowState.COMPLETED)
 
@@ -125,14 +125,30 @@ async def test_invalid_transition_is_rejected(db_session):
 
 @pytest.mark.asyncio
 async def test_completed_output_survives_new_session(db_session):
+    """Uses CONFLICT_SCAN (the new last real stage before COMPLETED) rather
+    than the retired PROCESSING placeholder — CONFLICT_SCAN is now where
+    "completing this stage moves the run to COMPLETED" is actually true.
+    Walks through the full real sequence to get there legitimately, which
+    doubles as a workflow_service-level regression check of the whole
+    Movement 1 transition chain, independent of graph.py.
+    """
     run = await create_run(db_session, documents=[_doc("doc.pdf")])
     await db_session.commit()
 
-    await start_stage(db_session, run.id, WorkflowState.PROCESSING)
-    await db_session.commit()
+    for stage in (
+        WorkflowState.CLASSIFYING,
+        WorkflowState.EXTRACTING,
+        WorkflowState.CONSOLIDATING,
+    ):
+        await start_stage(db_session, run.id, stage)
+        await db_session.commit()
+        await complete_stage(db_session, run.id, stage, output_data={})
+        await db_session.commit()
 
+    await start_stage(db_session, run.id, WorkflowState.CONFLICT_SCAN)
+    await db_session.commit()
     await complete_stage(
-        db_session, run.id, WorkflowState.PROCESSING, output_data={"pages_seen": 12}
+        db_session, run.id, WorkflowState.CONFLICT_SCAN, output_data={"conflicts_found": 0}
     )
     await db_session.commit()
 
@@ -148,12 +164,12 @@ async def test_completed_output_survives_new_session(db_session):
         result = await fresh_session.execute(
             select(StageCheckpoint).where(
                 StageCheckpoint.run_id == run.id,
-                StageCheckpoint.stage == WorkflowState.PROCESSING,
+                StageCheckpoint.stage == WorkflowState.CONFLICT_SCAN,
             )
         )
         checkpoint = result.scalar_one()
         assert checkpoint.status == CheckpointStatus.COMPLETED
-        assert checkpoint.output_data == {"pages_seen": 12}
+        assert checkpoint.output_data == {"conflicts_found": 0}
     await fresh_engine.dispose()
 
 
@@ -161,14 +177,14 @@ async def test_completed_output_survives_new_session(db_session):
 
 
 @pytest.mark.asyncio
-async def test_resume_after_interrupted_processing_identifies_processing(db_session):
+async def test_resume_after_interrupted_classifying_identifies_classifying(db_session):
     run = await create_run(db_session, documents=[_doc("doc.pdf")])
     await db_session.commit()
 
-    # PROCESSING is started and committed, but never completed — this is
+    # CLASSIFYING is started and committed, but never completed — this is
     # the "killed mid-stage" scenario. No in-memory flag is set anywhere;
     # the only evidence this happened is the committed IN_PROGRESS row.
-    await start_stage(db_session, run.id, WorkflowState.PROCESSING)
+    await start_stage(db_session, run.id, WorkflowState.CLASSIFYING)
     await db_session.commit()
 
     # A genuinely new engine/session, standing in for a restarted process
@@ -177,7 +193,7 @@ async def test_resume_after_interrupted_processing_identifies_processing(db_sess
     fresh_session_factory = async_sessionmaker(bind=fresh_engine, expire_on_commit=False)
     async with fresh_session_factory() as fresh_session:
         resume_stage = await get_resume_stage(fresh_session, run.id)
-        assert resume_stage == WorkflowState.PROCESSING
+        assert resume_stage == WorkflowState.CLASSIFYING
     await fresh_engine.dispose()
 
 
@@ -185,27 +201,36 @@ async def test_resume_after_interrupted_processing_identifies_processing(db_sess
 
 
 @pytest.mark.asyncio
-async def test_resume_after_completed_processing_does_not_rerun(db_session):
+async def test_resume_after_completed_conflict_scan_does_not_rerun(db_session):
+    """Uses CONFLICT_SCAN — the new last real stage — since that is now
+    where "completing this stage terminates the run" holds true.
+    """
     run = await create_run(db_session, documents=[_doc("doc.pdf")])
     await db_session.commit()
 
-    await start_stage(db_session, run.id, WorkflowState.PROCESSING)
-    await db_session.commit()
-    await complete_stage(db_session, run.id, WorkflowState.PROCESSING, output_data={"ok": True})
-    await db_session.commit()
+    for stage in (
+        WorkflowState.CLASSIFYING,
+        WorkflowState.EXTRACTING,
+        WorkflowState.CONSOLIDATING,
+        WorkflowState.CONFLICT_SCAN,
+    ):
+        await start_stage(db_session, run.id, stage)
+        await db_session.commit()
+        await complete_stage(db_session, run.id, stage, output_data={"ok": True})
+        await db_session.commit()
 
     fresh_engine = create_async_engine(TEST_DATABASE_URL, pool_pre_ping=True)
     fresh_session_factory = async_sessionmaker(bind=fresh_engine, expire_on_commit=False)
     async with fresh_session_factory() as fresh_session:
         resume_stage = await get_resume_stage(fresh_session, run.id)
-        # PROCESSING already completed -> run is COMPLETED, a terminal
-        # state, not PROCESSING again.
+        # CONFLICT_SCAN already completed -> run is COMPLETED, a terminal
+        # state, not CONFLICT_SCAN again.
         assert resume_stage == WorkflowState.COMPLETED
 
-        # And attempting to start PROCESSING again must be rejected, not
+        # And attempting to start CONFLICT_SCAN again must be rejected, not
         # silently accepted.
         with pytest.raises(InvalidStateTransitionError):
-            await start_stage(fresh_session, run.id, WorkflowState.PROCESSING)
+            await start_stage(fresh_session, run.id, WorkflowState.CONFLICT_SCAN)
     await fresh_engine.dispose()
 
 
@@ -217,9 +242,9 @@ async def test_complete_stage_without_in_progress_checkpoint_raises(db_session):
     run = await create_run(db_session, documents=[_doc("doc.pdf")])
     await db_session.commit()
 
-    # PROCESSING was never started, so there is nothing to complete.
+    # CLASSIFYING was never started, so there is nothing to complete.
     with pytest.raises(StageNotInProgressError):
-        await complete_stage(db_session, run.id, WorkflowState.PROCESSING, output_data={})
+        await complete_stage(db_session, run.id, WorkflowState.CLASSIFYING, output_data={})
 
 
 @pytest.mark.asyncio
