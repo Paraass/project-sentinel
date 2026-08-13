@@ -23,29 +23,62 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.persistence.models import (
     CheckpointStatus,
     Document,
+    FindingType,
+    Rule,
+    RuleSet,
     StageCheckpoint,
+    ValidationFinding,
     WorkflowRun,
     WorkflowState,
 )
 from app.storage.document_storage import DocumentInput, save_document
 
-# The only stage sequence this batch knows about. Later batches extend this
-# as real movement-level states (CLASSIFYING, EXTRACTING, ...) replace
-# PROCESSING as a single opaque step — this map is deliberately the seed,
-# not a final state machine.
+# Movement 1 (Understands the Pile) and Movement 2 (Examines)'s real stage
+# sequence, replacing the Batch 6/7 placeholder
+# (INTAKE_PENDING -> PROCESSING -> COMPLETED). Movement 3's states are not
+# added here — they don't exist yet, per this batch's own constraint.
 _ALLOWED_TRANSITIONS: dict[WorkflowState, set[WorkflowState]] = {
-    WorkflowState.INTAKE_PENDING: {WorkflowState.PROCESSING},
-    WorkflowState.PROCESSING: {WorkflowState.COMPLETED, WorkflowState.FAILED},
-    WorkflowState.COMPLETED: set(),
+    WorkflowState.INTAKE_PENDING: {WorkflowState.CLASSIFYING},
+    WorkflowState.CLASSIFYING: {WorkflowState.EXTRACTING, WorkflowState.FAILED},
+    WorkflowState.EXTRACTING: {WorkflowState.CONSOLIDATING, WorkflowState.FAILED},
+    WorkflowState.CONSOLIDATING: {WorkflowState.CONFLICT_SCAN, WorkflowState.FAILED},
+    WorkflowState.CONFLICT_SCAN: {WorkflowState.COMPLETED, WorkflowState.FAILED},
+    # COMPLETED is Movement 1's own terminal label (unchanged from Batch 9)
+    # *and* now also a legitimate starting point for Movement 2, entered
+    # only when a caller explicitly supplies a rule set — see graph.py's
+    # route_entry. Nothing about Movement-1-only runs changes: with no rule
+    # set requested, a run simply stays at COMPLETED, exactly as before.
+    WorkflowState.COMPLETED: {WorkflowState.RULE_VALIDATION_PENDING},
+    WorkflowState.RULE_VALIDATION_PENDING: {WorkflowState.VALIDATING},
+    WorkflowState.VALIDATING: {WorkflowState.AWAITING_HUMAN_REVIEW, WorkflowState.FAILED},
+    WorkflowState.AWAITING_HUMAN_REVIEW: set(),
     WorkflowState.FAILED: set(),
 }
 
 # Ordered so "the next stage after X" can be looked up positionally.
 _STAGE_SEQUENCE: list[WorkflowState] = [
     WorkflowState.INTAKE_PENDING,
-    WorkflowState.PROCESSING,
+    WorkflowState.CLASSIFYING,
+    WorkflowState.EXTRACTING,
+    WorkflowState.CONSOLIDATING,
+    WorkflowState.CONFLICT_SCAN,
     WorkflowState.COMPLETED,
+    WorkflowState.RULE_VALIDATION_PENDING,
+    WorkflowState.VALIDATING,
+    WorkflowState.AWAITING_HUMAN_REVIEW,
 ]
+
+# Explicit map of "completing this stage sets run.current_state to this
+# terminal-for-now label" pairs. Replaces the Batch 9 positional
+# `_STAGE_SEQUENCE[-2]` trick, which only worked because there was exactly
+# one such pair in a single flat list — with Movement 2 added there are now
+# two independent segments (Movement 1 ends at COMPLETED; Movement 2 ends
+# at AWAITING_HUMAN_REVIEW), so the transition needs to be named explicitly
+# per stage rather than inferred from list position.
+_TERMINAL_TRANSITIONS: dict[WorkflowState, WorkflowState] = {
+    WorkflowState.CONFLICT_SCAN: WorkflowState.COMPLETED,
+    WorkflowState.VALIDATING: WorkflowState.AWAITING_HUMAN_REVIEW,
+}
 
 
 class WorkflowError(Exception):
@@ -100,8 +133,8 @@ async def create_run(
     pointing at content that doesn't actually exist on disk. Intake's
     "work" happens atomically here, so it is recorded as an
     already-completed checkpoint rather than an IN_PROGRESS one — there is
-    no partial-intake state this batch needs to model, unlike PROCESSING,
-    which is where a real interruption risk exists.
+    no partial-intake state this batch needs to model, unlike the analytical
+    stages that follow, where a real interruption risk exists.
     """
     run = WorkflowRun(name=name, current_state=WorkflowState.INTAKE_PENDING)
     session.add(run)
@@ -187,11 +220,12 @@ async def complete_stage(
     checkpoint.completed_at = _now()
 
     run = await get_run(session, run_id)
-    if stage == WorkflowState.PROCESSING:
-        # PROCESSING completing is what makes the run COMPLETED — COMPLETED
-        # itself has no separate work/checkpoint in this minimal sequence,
-        # it is the resulting label, per the 3-state example in this batch.
-        run.current_state = WorkflowState.COMPLETED
+    if stage in _TERMINAL_TRANSITIONS:
+        # Completing certain stages sets a new terminal-for-now label on
+        # the run — COMPLETED after CONFLICT_SCAN, AWAITING_HUMAN_REVIEW
+        # after VALIDATING. Neither label has its own checkpoint; each is
+        # the resulting status, not a stage with its own work.
+        run.current_state = _TERMINAL_TRANSITIONS[stage]
 
     await session.flush()
     return checkpoint
@@ -240,6 +274,28 @@ async def find_in_progress_checkpoint(
     return result.scalar_one_or_none()
 
 
+async def get_completed_checkpoint(
+    session: AsyncSession, run_id: uuid.UUID, stage: WorkflowState
+) -> StageCheckpoint | None:
+    """Return the COMPLETED checkpoint for (run_id, stage), or None.
+
+    This is how a later stage reads an earlier stage's durable output —
+    e.g. CONSOLIDATING reading what EXTRACTING produced. It reads only from
+    Postgres, never from anything a caller might be holding in memory, which
+    is what makes "restart/resume does not redo completed analytical
+    stages" actually true rather than assumed: a fresh process calling this
+    gets the exact same answer a long-running one would.
+    """
+    result = await session.execute(
+        select(StageCheckpoint).where(
+            StageCheckpoint.run_id == run_id,
+            StageCheckpoint.stage == stage,
+            StageCheckpoint.status == CheckpointStatus.COMPLETED,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
 async def _in_progress_checkpoint(
     session: AsyncSession, run_id: uuid.UUID, stage: WorkflowState
 ) -> StageCheckpoint:
@@ -253,8 +309,11 @@ async def get_resume_stage(session: AsyncSession, run_id: uuid.UUID) -> Workflow
     """Determine what stage a caller should run next, reading only durable
     state — never any in-memory flag.
 
-    - If the run is already COMPLETED or FAILED, returns that terminal
-      state (nothing left to resume).
+    - If the run is already COMPLETED, FAILED, or AWAITING_HUMAN_REVIEW,
+      returns that state directly (nothing left to auto-resume — COMPLETED
+      may still be a legitimate entry point into Movement 2, but that
+      decision belongs to the caller, e.g. graph.py's route_entry, not to
+      this generic lookup).
     - If the latest checkpoint is IN_PROGRESS, returns that same stage —
       it was interrupted before finishing and must be resumed, not
       advanced past.
@@ -263,7 +322,11 @@ async def get_resume_stage(session: AsyncSession, run_id: uuid.UUID) -> Workflow
     """
     run = await get_run(session, run_id)
 
-    if run.current_state in (WorkflowState.COMPLETED, WorkflowState.FAILED):
+    if run.current_state in (
+        WorkflowState.COMPLETED,
+        WorkflowState.FAILED,
+        WorkflowState.AWAITING_HUMAN_REVIEW,
+    ):
         return run.current_state
 
     latest = await _latest_checkpoint(session, run_id)
@@ -282,3 +345,84 @@ def _now():
     from datetime import datetime, timezone
 
     return datetime.now(timezone.utc)
+
+
+async def create_rule_set(
+    session: AsyncSession,
+    name: str,
+    version: str,
+    rules: list[dict],
+) -> RuleSet:
+    """Create a RuleSet and its Rules in one call.
+
+    Not tied to any run — rule sets are reusable across runs, unlike
+    everything else this module creates. `rules` is plain data: each dict
+    needs identifier, description, rule_type, parameters, and optionally
+    order_index — this is exactly the "rules are data, not Python
+    branching" requirement expressed at the call site too, not just inside
+    the validator.
+    """
+    rule_set = RuleSet(name=name, version=version)
+    session.add(rule_set)
+    await session.flush()
+
+    for index, rule_data in enumerate(rules):
+        session.add(
+            Rule(
+                rule_set_id=rule_set.id,
+                identifier=rule_data["identifier"],
+                description=rule_data["description"],
+                rule_type=rule_data["rule_type"],
+                parameters=rule_data.get("parameters", {}),
+                order_index=rule_data.get("order_index", index),
+            )
+        )
+
+    await session.flush()
+    return rule_set
+
+
+async def get_rules_for_rule_set(session: AsyncSession, rule_set_id: uuid.UUID) -> list[Rule]:
+    """Load a rule set's rules, in stable order."""
+    result = await session.execute(
+        select(Rule).where(Rule.rule_set_id == rule_set_id).order_by(Rule.order_index)
+    )
+    return list(result.scalars().all())
+
+
+async def record_finding(
+    session: AsyncSession,
+    run_id: uuid.UUID,
+    rule: Rule,
+    rule_version: str,
+    finding_type: FindingType,
+    explanation: str,
+    evidence: str,
+    affected_claim_id: str | None = None,
+) -> ValidationFinding:
+    """Persist one validation finding as its own durable, independently
+    identifiable row. Never called for a satisfied rule — a satisfied rule
+    produces no row, which is what keeps "zero findings" a real, honest
+    outcome rather than a count of hidden "passed" rows.
+    """
+    finding = ValidationFinding(
+        run_id=run_id,
+        rule_id=rule.id,
+        rule_set_id=rule.rule_set_id,
+        rule_version=rule_version,
+        finding_type=finding_type,
+        explanation=explanation,
+        evidence=evidence,
+        affected_claim_id=affected_claim_id,
+    )
+    session.add(finding)
+    await session.flush()
+    return finding
+
+
+async def get_findings(session: AsyncSession, run_id: uuid.UUID) -> list[ValidationFinding]:
+    """Load every finding recorded for a run."""
+    result = await session.execute(
+        select(ValidationFinding).where(ValidationFinding.run_id == run_id)
+    )
+    return list(result.scalars().all())

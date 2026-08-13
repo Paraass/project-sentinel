@@ -18,7 +18,7 @@ import enum
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Enum, ForeignKey, String, Text
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, String, Text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.ext.asyncio import AsyncEngine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -31,16 +31,25 @@ class Base(DeclarativeBase):
 class WorkflowState(str, enum.Enum):
     """The workflow's overall run status.
 
-    Deliberately just the four states this batch needs. Later Build Orders
-    add the real movement-level states (CLASSIFYING, EXTRACTING,
-    CONSOLIDATING, VALIDATING, AWAITING_HUMAN_REVIEW, etc.) from the
-    approved behavioral architecture — this enum is the seed those will
-    extend, not a placeholder that gets thrown away.
+    PROCESSING (the Batch 6/7 placeholder) was retired in Batch 9, replaced
+    by the real Movement 1 stages it was always documented as a stand-in
+    for. CLASSIFYING/EXTRACTING/CONSOLIDATING/CONFLICT_SCAN are Movement 1
+    (Understands the Pile). RULE_VALIDATION_PENDING/VALIDATING/
+    AWAITING_HUMAN_REVIEW are Movement 2 (Examines), added in this batch.
+    AWAITING_HUMAN_REVIEW is deliberately NOT a success/terminal label the
+    way COMPLETED is — it's "waiting," not "done." What happens after it
+    (REVIEW_CLOSED, COMMITTING, ...) is a future batch's job to add.
     """
 
     INTAKE_PENDING = "INTAKE_PENDING"
-    PROCESSING = "PROCESSING"
+    CLASSIFYING = "CLASSIFYING"
+    EXTRACTING = "EXTRACTING"
+    CONSOLIDATING = "CONSOLIDATING"
+    CONFLICT_SCAN = "CONFLICT_SCAN"
     COMPLETED = "COMPLETED"
+    RULE_VALIDATION_PENDING = "RULE_VALIDATION_PENDING"
+    VALIDATING = "VALIDATING"
+    AWAITING_HUMAN_REVIEW = "AWAITING_HUMAN_REVIEW"
     FAILED = "FAILED"
 
 
@@ -91,6 +100,9 @@ class WorkflowRun(Base):
         back_populates="run", cascade="all, delete-orphan"
     )
     checkpoints: Mapped[list["StageCheckpoint"]] = relationship(
+        back_populates="run", cascade="all, delete-orphan"
+    )
+    findings: Mapped[list["ValidationFinding"]] = relationship(
         back_populates="run", cascade="all, delete-orphan"
     )
 
@@ -162,6 +174,104 @@ class StageCheckpoint(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     run: Mapped["WorkflowRun"] = relationship(back_populates="checkpoints")
+
+
+class RuleSet(Base):
+    """A named, versioned collection of rules to validate a run's grounded
+    deliverable against. Not tied to any one run — reusable across runs,
+    unlike everything else in this file so far.
+    """
+
+    __tablename__ = "rule_sets"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    version: Mapped[str] = mapped_column(String(50), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    rules: Mapped[list["Rule"]] = relationship(
+        back_populates="rule_set", cascade="all, delete-orphan"
+    )
+
+
+class Rule(Base):
+    """One rule within a RuleSet.
+
+    rule_type + parameters is the rule as DATA — a small, fixed set of
+    checkable rule_type "verbs" live in app.agents.rule_validator; which
+    keyword/key/allowed-values to check for a given row is pure parameter
+    data, never a new Python branch. description is human-readable only;
+    it is never parsed or acted on by the validator.
+    """
+
+    __tablename__ = "rules"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    rule_set_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("rule_sets.id", ondelete="CASCADE"), nullable=False
+    )
+    identifier: Mapped[str] = mapped_column(String(100), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    rule_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    parameters: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    order_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    rule_set: Mapped["RuleSet"] = relationship(back_populates="rules")
+
+
+class FindingType(str, enum.Enum):
+    VIOLATION = "VIOLATION"
+    CANNOT_EVALUATE = "CANNOT_EVALUATE"
+
+
+class ValidationFinding(Base):
+    """One durable, independently identifiable validation result.
+
+    Only VIOLATION and CANNOT_EVALUATE rows exist — a satisfied rule
+    produces no row at all, which is what makes "zero findings" a genuine,
+    inspectable outcome rather than a count of hidden "passed" rows.
+    rule_version is denormalized from RuleSet.version at the moment
+    validation ran, so a finding's meaning stays fixed even if the rule
+    set is edited or re-versioned later — the finding always says which
+    version actually produced it, not whatever the current version is.
+    """
+
+    __tablename__ = "validation_findings"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("workflow_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    rule_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("rules.id"), nullable=False
+    )
+    rule_set_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("rule_sets.id"), nullable=False
+    )
+    rule_version: Mapped[str] = mapped_column(String(50), nullable=False)
+    finding_type: Mapped[FindingType] = mapped_column(
+        Enum(FindingType, name="finding_type"), nullable=False
+    )
+    explanation: Mapped[str] = mapped_column(Text, nullable=False)
+    evidence: Mapped[str] = mapped_column(Text, nullable=False)
+    affected_claim_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    run: Mapped["WorkflowRun"] = relationship(back_populates="findings")
 
 
 async def init_models(engine: AsyncEngine) -> None:
