@@ -24,6 +24,10 @@ from app.persistence.models import (
     CheckpointStatus,
     Document,
     FindingType,
+    Report,
+    ReportChangelogEntry,
+    ReviewDecision,
+    ReviewItem,
     Rule,
     RuleSet,
     StageCheckpoint,
@@ -33,10 +37,10 @@ from app.persistence.models import (
 )
 from app.storage.document_storage import DocumentInput, save_document
 
-# Movement 1 (Understands the Pile) and Movement 2 (Examines)'s real stage
+# Movement 1 (Understands the Pile), Movement 2 (Examines), the shared
+# review/commit lifecycle, and Movement 3 (Stays Alive)'s real stage
 # sequence, replacing the Batch 6/7 placeholder
-# (INTAKE_PENDING -> PROCESSING -> COMPLETED). Movement 3's states are not
-# added here — they don't exist yet, per this batch's own constraint.
+# (INTAKE_PENDING -> PROCESSING -> COMPLETED).
 _ALLOWED_TRANSITIONS: dict[WorkflowState, set[WorkflowState]] = {
     WorkflowState.INTAKE_PENDING: {WorkflowState.CLASSIFYING},
     WorkflowState.CLASSIFYING: {WorkflowState.EXTRACTING, WorkflowState.FAILED},
@@ -51,7 +55,24 @@ _ALLOWED_TRANSITIONS: dict[WorkflowState, set[WorkflowState]] = {
     WorkflowState.COMPLETED: {WorkflowState.RULE_VALIDATION_PENDING},
     WorkflowState.RULE_VALIDATION_PENDING: {WorkflowState.VALIDATING},
     WorkflowState.VALIDATING: {WorkflowState.AWAITING_HUMAN_REVIEW, WorkflowState.FAILED},
-    WorkflowState.AWAITING_HUMAN_REVIEW: set(),
+    # AWAITING_HUMAN_REVIEW only advances on an EXPLICIT close request (see
+    # graph.py's route_entry) — never automatically, per Batch 11's
+    # "require an explicit close operation" requirement.
+    WorkflowState.AWAITING_HUMAN_REVIEW: {WorkflowState.REVIEW_CLOSED},
+    WorkflowState.REVIEW_CLOSED: {WorkflowState.COMMITTING},
+    WorkflowState.COMMITTING: {WorkflowState.REPORT_COMMITTED, WorkflowState.FAILED},
+    WorkflowState.REPORT_COMMITTED: {WorkflowState.WATCHING},
+    # WATCHING, like COMPLETED and AWAITING_HUMAN_REVIEW, only advances when
+    # a caller explicitly supplies a new document — see route_entry.
+    WorkflowState.WATCHING: {WorkflowState.NEW_DOCUMENT_DETECTED},
+    WorkflowState.NEW_DOCUMENT_DETECTED: {WorkflowState.IMPACT_ANALYSIS, WorkflowState.FAILED},
+    WorkflowState.IMPACT_ANALYSIS: {WorkflowState.FOCUSED_UPDATE_DRAFTING, WorkflowState.FAILED},
+    # FOCUSED_UPDATE_DRAFTING feeds back into the SAME shared review queue
+    # Movement 2 uses — not a second approval mechanism.
+    WorkflowState.FOCUSED_UPDATE_DRAFTING: {
+        WorkflowState.AWAITING_HUMAN_REVIEW,
+        WorkflowState.FAILED,
+    },
     WorkflowState.FAILED: set(),
 }
 
@@ -66,18 +87,26 @@ _STAGE_SEQUENCE: list[WorkflowState] = [
     WorkflowState.RULE_VALIDATION_PENDING,
     WorkflowState.VALIDATING,
     WorkflowState.AWAITING_HUMAN_REVIEW,
+    WorkflowState.REVIEW_CLOSED,
+    WorkflowState.COMMITTING,
+    WorkflowState.REPORT_COMMITTED,
+    WorkflowState.WATCHING,
+    WorkflowState.NEW_DOCUMENT_DETECTED,
+    WorkflowState.IMPACT_ANALYSIS,
+    WorkflowState.FOCUSED_UPDATE_DRAFTING,
 ]
 
 # Explicit map of "completing this stage sets run.current_state to this
-# terminal-for-now label" pairs. Replaces the Batch 9 positional
-# `_STAGE_SEQUENCE[-2]` trick, which only worked because there was exactly
-# one such pair in a single flat list — with Movement 2 added there are now
-# two independent segments (Movement 1 ends at COMPLETED; Movement 2 ends
-# at AWAITING_HUMAN_REVIEW), so the transition needs to be named explicitly
-# per stage rather than inferred from list position.
+# terminal-for-now label" pairs. There are now three independent segments:
+# Movement 1 ends at COMPLETED; Movement 2 (and Movement 3, feeding back
+# into the same queue) ends at AWAITING_HUMAN_REVIEW; COMMITTING ends at
+# REPORT_COMMITTED. Named explicitly per stage rather than inferred from
+# list position.
 _TERMINAL_TRANSITIONS: dict[WorkflowState, WorkflowState] = {
     WorkflowState.CONFLICT_SCAN: WorkflowState.COMPLETED,
     WorkflowState.VALIDATING: WorkflowState.AWAITING_HUMAN_REVIEW,
+    WorkflowState.FOCUSED_UPDATE_DRAFTING: WorkflowState.AWAITING_HUMAN_REVIEW,
+    WorkflowState.COMMITTING: WorkflowState.REPORT_COMMITTED,
 }
 
 
@@ -165,6 +194,40 @@ async def create_run(
     return run
 
 
+async def add_document_to_run(
+    session: AsyncSession, run_id: uuid.UUID, document_input: DocumentInput
+) -> Document:
+    """Register one additional document against an already-processed run —
+    Movement 3's scoped intake.
+
+    Unlike create_run, this never touches WorkflowRun.current_state or
+    creates an INTAKE_PENDING checkpoint; the run already has one, and
+    existing documents are never touched or reprocessed. Reuses the exact
+    same content-addressed storage path as the original cold-start intake,
+    so there is only ever one way a document's bytes get durably stored.
+    """
+    stored = save_document(document_input)
+    document = Document(
+        run_id=run_id,
+        filename=document_input.filename,
+        storage_key=stored.storage_key,
+        content_hash=stored.content_hash,
+        size_bytes=stored.size,
+        content_type=stored.content_type,
+    )
+    session.add(document)
+    await session.flush()
+    return document
+
+
+async def get_document(session: AsyncSession, document_id: uuid.UUID) -> Document:
+    """Load a single document by id."""
+    document = await session.get(Document, document_id)
+    if document is None:
+        raise WorkflowError(f"No document found for id {document_id}")
+    return document
+
+
 async def _latest_checkpoint(
     session: AsyncSession, run_id: uuid.UUID
 ) -> StageCheckpoint | None:
@@ -178,11 +241,22 @@ async def _latest_checkpoint(
 
 
 async def start_stage(
-    session: AsyncSession, run_id: uuid.UUID, stage: WorkflowState
+    session: AsyncSession,
+    run_id: uuid.UUID,
+    stage: WorkflowState,
+    initial_output_data: dict | None = None,
 ) -> StageCheckpoint:
     """Transition a run into `stage` and persist an IN_PROGRESS checkpoint
     for it. Rejects the transition if it isn't allowed from the run's
     current state.
+
+    `initial_output_data`, if given, is durably recorded on the checkpoint
+    immediately — before any of the stage's real work runs — for the rare
+    case where a node needs to remember something (e.g. which document it
+    is processing) that must survive a crash occurring before that node's
+    own work finishes. This is different from complete_stage's
+    output_data, which is the stage's actual result; this is just enough
+    context for a resumed attempt to pick up where a crashed one left off.
     """
     run = await get_run(session, run_id)
 
@@ -193,6 +267,7 @@ async def start_stage(
         run_id=run.id,
         stage=stage,
         status=CheckpointStatus.IN_PROGRESS,
+        output_data=initial_output_data,
     )
     session.add(checkpoint)
     run.current_state = stage
@@ -326,6 +401,7 @@ async def get_resume_stage(session: AsyncSession, run_id: uuid.UUID) -> Workflow
         WorkflowState.COMPLETED,
         WorkflowState.FAILED,
         WorkflowState.AWAITING_HUMAN_REVIEW,
+        WorkflowState.WATCHING,
     ):
         return run.current_state
 
@@ -424,5 +500,98 @@ async def get_findings(session: AsyncSession, run_id: uuid.UUID) -> list[Validat
     """Load every finding recorded for a run."""
     result = await session.execute(
         select(ValidationFinding).where(ValidationFinding.run_id == run_id)
+    )
+    return list(result.scalars().all())
+
+
+# --- Shared review/commit lifecycle helpers (Batch 11 Part A) --------------
+
+
+async def create_review_item(
+    session: AsyncSession,
+    run_id: uuid.UUID,
+    item_type: str,
+    source_reference: str,
+    content: dict,
+) -> ReviewItem:
+    """Add one independently decidable item to the review queue.
+
+    Called by whichever stage produced something reviewable (VALIDATING
+    for findings; FOCUSED_UPDATE_DRAFTING for proposed changes/conflicts)
+    at the moment it completes, so every item awaiting AWAITING_HUMAN_REVIEW
+    genuinely exists in the queue before a human — or a test — can decide
+    on it.
+    """
+    item = ReviewItem(
+        run_id=run_id,
+        item_type=item_type,
+        source_reference=source_reference,
+        content=content,
+    )
+    session.add(item)
+    await session.flush()
+    return item
+
+
+async def get_review_items(session: AsyncSession, run_id: uuid.UUID) -> list[ReviewItem]:
+    """Load every review item for a run."""
+    result = await session.execute(select(ReviewItem).where(ReviewItem.run_id == run_id))
+    return list(result.scalars().all())
+
+
+async def decide_review_item(
+    session: AsyncSession,
+    item_id: uuid.UUID,
+    decision: ReviewDecision,
+    decided_by: str,
+    reason: str | None = None,
+) -> ReviewItem:
+    """Record an attributable decision on one review item.
+
+    decided_by is required — a decision with no attribution isn't a
+    decision this system can account for later. Deciding one item never
+    touches any other row.
+    """
+    item = await session.get(ReviewItem, item_id)
+    if item is None:
+        raise WorkflowError(f"No review item found for id {item_id}")
+
+    item.decision = decision
+    item.decided_by = decided_by
+    item.decision_reason = reason
+    item.decided_at = _now()
+
+    await session.flush()
+    return item
+
+
+async def get_current_report(session: AsyncSession, run_id: uuid.UUID) -> Report | None:
+    """Load the current (is_current=True) committed report for a run, or
+    None if nothing has been committed yet.
+    """
+    result = await session.execute(
+        select(Report).where(Report.run_id == run_id, Report.is_current.is_(True))
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_report_version(
+    session: AsyncSession, run_id: uuid.UUID, version: int
+) -> Report | None:
+    """Load a specific, possibly-superseded report version — proves older
+    versions genuinely still exist rather than having been overwritten.
+    """
+    result = await session.execute(
+        select(Report).where(Report.run_id == run_id, Report.version == version)
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_changelog(session: AsyncSession, run_id: uuid.UUID) -> list[ReportChangelogEntry]:
+    """Load every changelog entry for a run, oldest first."""
+    result = await session.execute(
+        select(ReportChangelogEntry)
+        .where(ReportChangelogEntry.run_id == run_id)
+        .order_by(ReportChangelogEntry.report_version)
     )
     return list(result.scalars().all())

@@ -18,7 +18,7 @@ import enum
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, String, Text, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.ext.asyncio import AsyncEngine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -35,10 +35,11 @@ class WorkflowState(str, enum.Enum):
     by the real Movement 1 stages it was always documented as a stand-in
     for. CLASSIFYING/EXTRACTING/CONSOLIDATING/CONFLICT_SCAN are Movement 1
     (Understands the Pile). RULE_VALIDATION_PENDING/VALIDATING/
-    AWAITING_HUMAN_REVIEW are Movement 2 (Examines), added in this batch.
-    AWAITING_HUMAN_REVIEW is deliberately NOT a success/terminal label the
-    way COMPLETED is — it's "waiting," not "done." What happens after it
-    (REVIEW_CLOSED, COMMITTING, ...) is a future batch's job to add.
+    AWAITING_HUMAN_REVIEW are Movement 2 (Examines). REVIEW_CLOSED/
+    COMMITTING/REPORT_COMMITTED/WATCHING are the shared review/commit
+    lifecycle both movements feed into. NEW_DOCUMENT_DETECTED/
+    IMPACT_ANALYSIS/FOCUSED_UPDATE_DRAFTING are Movement 3 (Stays Alive),
+    all added in this batch.
     """
 
     INTAKE_PENDING = "INTAKE_PENDING"
@@ -50,6 +51,13 @@ class WorkflowState(str, enum.Enum):
     RULE_VALIDATION_PENDING = "RULE_VALIDATION_PENDING"
     VALIDATING = "VALIDATING"
     AWAITING_HUMAN_REVIEW = "AWAITING_HUMAN_REVIEW"
+    REVIEW_CLOSED = "REVIEW_CLOSED"
+    COMMITTING = "COMMITTING"
+    REPORT_COMMITTED = "REPORT_COMMITTED"
+    WATCHING = "WATCHING"
+    NEW_DOCUMENT_DETECTED = "NEW_DOCUMENT_DETECTED"
+    IMPACT_ANALYSIS = "IMPACT_ANALYSIS"
+    FOCUSED_UPDATE_DRAFTING = "FOCUSED_UPDATE_DRAFTING"
     FAILED = "FAILED"
 
 
@@ -274,12 +282,157 @@ class ValidationFinding(Base):
     run: Mapped["WorkflowRun"] = relationship(back_populates="findings")
 
 
+class ReviewDecision(str, enum.Enum):
+    PENDING = "PENDING"
+    APPROVED = "APPROVED"
+    REJECTED = "REJECTED"
+    DEFERRED = "DEFERRED"
+
+
+class ReviewItem(Base):
+    """One independently decidable item in the shared human-review queue.
+
+    item_type is a small fixed vocabulary ("finding" from Movement 2,
+    "proposed_change"/"conflict" from Movement 3) — deliberately not a
+    generic pluggable framework. source_reference identifies which
+    underlying object (a ValidationFinding's id, or a
+    f"{baseline_claim_id}:{new_claim_id}" pair for a Movement 3 proposal)
+    this item represents; content is a snapshot so a reviewer never needs
+    to reconstruct context from elsewhere. Rejecting or deferring one item
+    never touches any other row here — that independence is what makes
+    "reject one, keep the rest" true at the data-shape level.
+    """
+
+    __tablename__ = "review_items"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("workflow_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    item_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    source_reference: Mapped[str] = mapped_column(String(255), nullable=False)
+    content: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    decision: Mapped[ReviewDecision] = mapped_column(
+        Enum(ReviewDecision, name="review_decision"),
+        nullable=False,
+        default=ReviewDecision.PENDING,
+    )
+    decision_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    decided_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+
+class Report(Base):
+    """One committed, versioned snapshot of a run's grounded deliverable.
+
+    is_current marks the latest version; older versions are never deleted
+    or overwritten (immutable versions), only superseded. content carries
+    each statement plus key/value where available, so a later Movement 3
+    impact analysis has structured facts to compare against, not just
+    prose text — a plain ConsolidatedStatement alone doesn't carry that.
+    """
+
+    __tablename__ = "reports"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("workflow_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    content: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    is_current: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+
+class ReportChangelogEntry(Base):
+    """One durable record of what changed, when, and because of what,
+    for one committed report version. This is the literal answer to
+    "what changed / when / which source / which sections" required of
+    every commit, Movement 1's initial one included.
+    """
+
+    __tablename__ = "report_changelog_entries"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("workflow_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    report_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    source_document_ids: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    affected_claim_ids: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+
+# Every native Postgres enum type this schema declares, paired with its
+# Python source of truth. `create_all` only creates a type if it doesn't
+# exist yet — it never alters one that's already there, so a type created
+# under an earlier version of a Python enum silently keeps its old values
+# forever otherwise. This is the exact "first time an existing object
+# needs to change shape" case flagged as the trigger for needing more than
+# create_all — this reconciliation is that minimal next step, short of
+# introducing a full migration framework.
+_NATIVE_ENUMS: dict[str, type[enum.Enum]] = {
+    "workflow_state": WorkflowState,
+    "checkpoint_status": CheckpointStatus,
+    "finding_type": FindingType,
+    "review_decision": ReviewDecision,
+}
+
+
+async def _sync_enum_values(conn) -> None:
+    """Add any enum value present in a Python enum but missing from its
+    already-created Postgres type, without dropping, renaming, or
+    reordering anything.
+
+    Postgres supports `ALTER TYPE ... ADD VALUE` for exactly this add-only
+    case (safe inside a transaction on PG12+). It does not support
+    removing or renaming a value without recreating the type — that stays
+    genuinely out of scope for this reconciliation, since it would risk
+    existing rows referencing a value being removed. A leftover, unused
+    stale value (like a value that no longer exists in the Python enum)
+    is harmless and is deliberately left in place rather than dropped.
+    """
+    for pg_type_name, python_enum in _NATIVE_ENUMS.items():
+        result = await conn.execute(
+            text("SELECT enumlabel FROM pg_enum WHERE enumtypid = CAST(:type_name AS regtype)"),
+            {"type_name": pg_type_name},
+        )
+        existing_values = {row[0] for row in result}
+
+        for member in python_enum:
+            if member.value not in existing_values:
+                # Value names are interpolated, not bound as parameters —
+                # ALTER TYPE is DDL and doesn't accept bind parameters for
+                # the value literal in all drivers; safe here because both
+                # pg_type_name and member.value come only from this
+                # module's own hardcoded enum definitions, never from user
+                # or request input.
+                await conn.execute(
+                    text(f"ALTER TYPE {pg_type_name} ADD VALUE IF NOT EXISTS '{member.value}'")
+                )
+
+
 async def init_models(engine: AsyncEngine) -> None:
-    """Create tables that don't already exist.
+    """Create tables/types that don't already exist, then reconcile any
+    native enum type that already existed under an older set of values.
 
     Called once at application startup (see app/main.py). Safe to call
-    repeatedly — `create_all` is a no-op for tables that already exist, so
-    this does not disturb data across restarts.
+    repeatedly — both steps are no-ops once the schema already matches.
     """
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await _sync_enum_values(conn)

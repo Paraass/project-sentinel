@@ -52,6 +52,7 @@ services:
     profiles: ["test"]
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      TEST_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/sentinel_test
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       ENVIRONMENT: test
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
