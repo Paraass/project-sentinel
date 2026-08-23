@@ -4,7 +4,7 @@ An AI-powered Project Documentation Analyst that continuously analyzes software 
 
 ## Status
 
-This repository currently contains the **repository foundation** (Build Order 001): infrastructure, backend bootstrap, and frontend bootstrap. The application layer — document ingestion, the LangGraph workflow, agents, the review queue, and reporting — is implemented in later Build Orders and is not yet present. The backend currently exposes a single endpoint (`/health`); the frontend currently renders a single placeholder page.
+This repository currently contains the **repository foundation** (Build Order 001): infrastructure, backend bootstrap, and frontend bootstrap. The application layer — document ingestion, the LangGraph workflow, agents, the review queue, and reporting - is implemented in later Build Orders and is not yet present. The backend currently exposes a single endpoint (`/health`); the frontend currently renders a single placeholder page.
 
 ## Stack
 
