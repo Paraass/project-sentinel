@@ -1,7 +1,12 @@
-import PileOverview from "./pages/PileOverview";
+import { AppShell } from "@/components/AppShell";
+import PileOverview from "@/pages/PileOverview";
 
 function App() {
-  return <PileOverview />;
+  return (
+    <AppShell>
+      <PileOverview />
+    </AppShell>
+  );
 }
 
 export default App;

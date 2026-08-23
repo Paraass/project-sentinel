@@ -41,13 +41,10 @@ export interface ChangelogEntryResponse {
   created_at: string;
 }
 
-interface ErrorResponse {
-  detail: string;
-}
+interface ErrorResponse { detail: string; }
 
 export class ApiError extends Error {
   readonly status: number;
-
   constructor(status: number, detail: string) {
     super(detail);
     this.name = "ApiError";
@@ -55,27 +52,25 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(path: string): Promise<T> {
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response;
-
   try {
-    response = await fetch(`${API_BASE_URL}${path}`);
+    response = await fetch(`${API_BASE_URL}${path}`, {
+      ...init,
+      headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
+    });
   } catch {
     throw new ApiError(0, "Could not reach the Sentinel backend.");
   }
 
   if (!response.ok) {
     let detail = `Request failed with status ${response.status}.`;
-
     try {
       const body = (await response.json()) as ErrorResponse;
-      if (body?.detail) {
-        detail = body.detail;
-      }
+      if (body?.detail) detail = body.detail;
     } catch {
-      // Fall back to the generic HTTP error above.
+      // Keep the generic HTTP error.
     }
-
     throw new ApiError(response.status, detail);
   }
 
@@ -87,19 +82,53 @@ export function getRun(runId: string): Promise<RunResponse> {
 }
 
 export function getReviewItems(runId: string): Promise<ReviewItemResponse[]> {
-  return request<ReviewItemResponse[]>(
-    `/runs/${encodeURIComponent(runId)}/review-items`,
-  );
+  return request<ReviewItemResponse[]>(`/runs/${encodeURIComponent(runId)}/review-items`);
+}
+
+export function decideReviewItem(
+  itemId: string,
+  decision: "approve" | "reject" | "defer",
+  decidedBy: string,
+  reason?: string,
+): Promise<ReviewItemResponse> {
+  return request<ReviewItemResponse>(`/review-items/${encodeURIComponent(itemId)}/decision`, {
+    method: "POST",
+    body: JSON.stringify({ decision, decided_by: decidedBy, reason: reason || null }),
+  });
+}
+
+export function closeReview(runId: string): Promise<RunResponse> {
+  return request<RunResponse>(`/runs/${encodeURIComponent(runId)}/review/close`, { method: "POST" });
 }
 
 export function getCurrentReport(runId: string): Promise<ReportResponse> {
   return request<ReportResponse>(`/runs/${encodeURIComponent(runId)}/report`);
 }
 
-export function getChangelog(
-  runId: string,
-): Promise<ChangelogEntryResponse[]> {
-  return request<ChangelogEntryResponse[]>(
-    `/runs/${encodeURIComponent(runId)}/changelog`,
-  );
+export function getReportVersion(runId: string, version: number): Promise<ReportResponse> {
+  return request<ReportResponse>(`/runs/${encodeURIComponent(runId)}/report/${version}`);
+}
+
+export function getChangelog(runId: string): Promise<ChangelogEntryResponse[]> {
+  return request<ChangelogEntryResponse[]>(`/runs/${encodeURIComponent(runId)}/changelog`);
+}
+
+export interface DocumentUpload {
+  filename: string;
+  content_base64: string;
+  content_type?: string;
+}
+
+export function createRun(name: string, documents: DocumentUpload[]): Promise<RunResponse> {
+  return request<RunResponse>("/runs", {
+    method: "POST",
+    body: JSON.stringify({ name: name || null, documents }),
+  });
+}
+
+export function submitNewDocument(runId: string, document: DocumentUpload): Promise<RunResponse> {
+  return request<RunResponse>(`/runs/${encodeURIComponent(runId)}/documents`, {
+    method: "POST",
+    body: JSON.stringify(document),
+  });
 }
