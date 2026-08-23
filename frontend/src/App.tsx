@@ -1,7 +1,7 @@
-import Landing from "./pages/Landing";
+import PileOverview from "./pages/PileOverview";
 
 function App() {
-  return <Landing />;
+  return <PileOverview />;
 }
 
 export default App;
