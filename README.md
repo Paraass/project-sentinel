@@ -156,10 +156,10 @@ docker compose --profile test run --rm backend-test
 
 The current submission is deployed on Render:
 
-- Backend: `https://project-sentinel-fk8f.onrender.com`
-- Backend health check: `https://project-sentinel-fk8f.onrender.com/health`
-- Backend API documentation: `https://project-sentinel-fk8f.onrender.com/docs`
-- Frontend: `https://sentinel-frontend-w2o6.onrender.com`
+- **Frontend:** [Project Sentinel](https://sentinel-frontend-w2o6.onrender.com)
+- **Backend:** [Project Sentinel API](https://project-sentinel-fk8f.onrender.com)
+- **Backend health check:** [Health endpoint](https://project-sentinel-fk8f.onrender.com/health)
+- **API documentation:** [Swagger UI](https://project-sentinel-fk8f.onrender.com/docs)
 
 The deployment uses Render's free tier. Free instances can sleep after inactivity, so the first request after an idle period may be delayed.
 
