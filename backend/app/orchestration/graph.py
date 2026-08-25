@@ -253,9 +253,18 @@ async def _conflict_scan_node(
         claims = _load_claims_from_checkpoint(extracting_checkpoint)
         conflicts = scan_conflicts(claims)
 
-        output = {"conflicts": [_serialize(c) for c in conflicts]}
+        for conflict in conflicts:
+            await create_review_item(
+                session,
+                run_id,
+                item_type="conflict",
+                source_reference=conflict.conflict_id,
+                content=_serialize(conflict),
+            )
+
         # Completing CONFLICT_SCAN is what moves the run to COMPLETED
         # (see workflow_service.complete_stage) — nothing extra needed here.
+        output = {"conflicts": [_serialize(c) for c in conflicts]}
         await complete_stage(session, run_id, stage, output_data=output)
         await session.commit()
     except Exception as exc:  # noqa: BLE001
