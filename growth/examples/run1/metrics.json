@@ -1,0 +1,11 @@
+{
+  "input_targets": 5,
+  "selected_targets": 5,
+  "selection_rate": 1.0,
+  "public_targets_selected": 4,
+  "synthetic_targets_selected": 1,
+  "average_fit_score": 85.0,
+  "drafts_created": 5,
+  "messages_sent": 0,
+  "human_review_required": 5
+}
